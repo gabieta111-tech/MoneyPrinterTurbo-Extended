@@ -1228,6 +1228,160 @@ def tts(
     return azure_tts_v1(text, voice_name, voice_rate, voice_file)
 
 
+def qwen_tts(
+    text: str,
+    voice_name: str,
+    voice_rate: float,
+    voice_file: str,
+    voice_volume: float = 1.0,
+) -> Union[SubMaker, None]:
+    """
+    使用Qwen TTS生成语音
+
+    Args:
+        text: 要转换为语音的文本
+        voice_name: 声音名称，格式: "qwen:type:name-Gender" (e.g. "qwen:default:Default Voice-Neutral" or "qwen:clone:name-Custom")
+        voice_rate: 语音速度（暂不支持）
+        voice_file: 输出的音频文件路径
+        voice_volume: 语音音量（暂不支持）
+
+    Returns:
+        SubMaker对象或None
+    """
+    if not QWEN_TTS_AVAILABLE:
+        logger.error("Qwen TTS is not available. Please install qwen-tts: pip install qwen-tts")
+        return None
+
+    text = text.strip()
+    if not text:
+        logger.error("Text is empty")
+        return None
+
+    # Parse voice_name: qwen:type:name-Gender
+    parts = voice_name.split(":")
+    if len(parts) < 3:
+        logger.error(f"Invalid Qwen voice name format: {voice_name}")
+        return None
+
+    voice_type = parts[1]  # "default" or "clone"
+    voice_info = parts[2]  # "name-Gender" e.g. "Default Voice-Neutral"
+    voice_base_name = voice_info.split("-")[0]
+
+    global qwen_tts_model
+
+    for i in range(3):
+        try:
+            logger.info(f"start qwen tts, voice: {voice_name}, try: {i + 1}")
+
+            # Load model if not already loaded
+            if qwen_tts_model is None:
+                logger.info("Loading Qwen TTS model (first run may download weights)...")
+                device = "cuda:0" if torch.cuda.is_available() else "cpu"
+                dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+                if voice_type == "clone":
+                    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+                else:
+                    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+
+                qwen_tts_model = Qwen3TTSModel.from_pretrained(
+                    model_name,
+                    device_map=device,
+                    dtype=dtype,
+                )
+                logger.info(f"Qwen TTS model loaded: {model_name} on {device}")
+
+            # Generate speech
+            if voice_type == "clone":
+                # Voice clone mode - look for reference audio
+                reference_audio_dir = os.path.join(utils.root_dir(), "reference_audio")
+                ref_audio_path = None
+
+                # Search for matching reference audio file
+                if os.path.exists(reference_audio_dir):
+                    for ext in ['.wav', '.mp3', '.flac', '.m4a']:
+                        candidate = os.path.join(reference_audio_dir, voice_base_name + ext)
+                        if os.path.exists(candidate):
+                            ref_audio_path = candidate
+                            break
+
+                if not ref_audio_path:
+                    logger.error(f"Reference audio file not found for voice clone: {voice_base_name}")
+                    return None
+
+                logger.info(f"Using reference audio: {ref_audio_path}")
+                wavs, sr = qwen_tts_model.generate_voice_clone(
+                    text=text,
+                    language="Auto",
+                    ref_audio=ref_audio_path,
+                    ref_text="",
+                    x_vector_only_mode=True,
+                )
+            else:
+                # Default/custom voice mode
+                speaker = "Vivian"  # Default speaker
+                wavs, sr = qwen_tts_model.generate_custom_voice(
+                    text=text,
+                    language="Auto",
+                    speaker=speaker,
+                )
+
+            if wavs is None or len(wavs) == 0:
+                logger.warning(f"Qwen TTS returned empty audio, try: {i + 1}")
+                continue
+
+            # Save as wav first, then convert to mp3
+            import soundfile as sf
+            temp_wav = voice_file.replace(".mp3", ".wav")
+            sf.write(temp_wav, wavs[0], sr)
+
+            # Convert to mp3 using moviepy/ffmpeg
+            try:
+                from moviepy import AudioFileClip
+                audio_clip = AudioFileClip(temp_wav)
+                audio_clip.write_audiofile(voice_file, logger=None)
+                audio_duration = audio_clip.duration
+                audio_clip.close()
+                # Clean up temp wav
+                if os.path.exists(temp_wav):
+                    os.remove(temp_wav)
+            except Exception as conv_err:
+                logger.warning(f"Failed to convert to mp3, using wav: {conv_err}")
+                # Fall back to using the wav file directly
+                import shutil
+                shutil.move(temp_wav, voice_file)
+                # Estimate duration from samples
+                audio_duration = len(wavs[0]) / sr
+
+            # Create SubMaker with estimated timestamps
+            sub_maker = ensure_submaker_compatibility(SubMaker())
+            audio_duration_100ns = int(audio_duration * 10000000)
+
+            sentences = utils.split_string_by_punctuations(text)
+            if sentences:
+                total_chars = sum(len(s) for s in sentences)
+                char_duration = audio_duration_100ns / total_chars if total_chars > 0 else 0
+                current_offset = 0
+                for sentence in sentences:
+                    if not sentence.strip():
+                        continue
+                    sentence_duration = int(len(sentence) * char_duration)
+                    sub_maker.subs.append(sentence)
+                    sub_maker.offset.append((current_offset, current_offset + sentence_duration))
+                    current_offset += sentence_duration
+            else:
+                sub_maker.subs = [text]
+                sub_maker.offset = [(0, audio_duration_100ns)]
+
+            logger.success(f"Qwen TTS succeeded: {voice_file}")
+            return sub_maker
+
+        except Exception as e:
+            logger.error(f"Qwen TTS failed (try {i + 1}): {str(e)}")
+
+    return None
+
+
 def convert_rate_to_percent(rate: float) -> str:
     if rate == 1.0:
         return "+0%"
