@@ -48,7 +48,7 @@ whisperx_model = None
 
 # Import Qwen TTS if available
 try:
-    from qwen_tts.model import Qwen3TTSModel
+    from qwen_tts import Qwen3TTSModel
     import torch
     import torchaudio
     QWEN_TTS_AVAILABLE = True
